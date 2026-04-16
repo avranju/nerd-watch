@@ -11,6 +11,6 @@ anyhow = "1"
 futures = "0.3"
 bollard = "0.17"
 clap = { version = "4", features = ["derive", "env"] }
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
