@@ -10,6 +10,7 @@ use bollard::models::ContainerStateStatusEnum;
 use bollard::models::HealthStatusEnum;
 use bollard::Docker;
 use clap::Parser;
+use tokio::signal::unix::{signal, SignalKind};
 use tracing::{error, info, warn};
 
 const INITIAL_BACKOFF: Duration = Duration::from_secs(5);
@@ -44,7 +45,6 @@ struct Args {
 
 /// Per-container tracking state.
 struct ContainerState {
-    name: String,
     /// Current backoff duration — doubles after each restart attempt, capped at MAX_BACKOFF.
     backoff: Duration,
     /// Earliest time we are allowed to attempt the next restart.
@@ -59,9 +59,8 @@ struct ContainerState {
 }
 
 impl ContainerState {
-    fn new(name: String) -> Self {
+    fn new() -> Self {
         Self {
-            name,
             backoff: INITIAL_BACKOFF,
             next_restart_at: None,
             restart_count: 0,
@@ -72,7 +71,7 @@ impl ContainerState {
 
     /// Called when the container is observed as running and healthy enough to be considered stable.
     /// Resets the backoff once the container has been stable for STABILITY_THRESHOLD.
-    fn on_healthy(&mut self) {
+    fn on_healthy(&mut self, name: &str) {
         self.unhealthy_since = None;
 
         let now = Instant::now();
@@ -80,7 +79,7 @@ impl ContainerState {
 
         if self.restart_count > 0 && since.elapsed() >= STABILITY_THRESHOLD {
             info!(
-                container = %self.name,
+                container = %name,
                 uptime_secs = since.elapsed().as_secs(),
                 "Container is stable — resetting restart backoff"
             );
@@ -122,13 +121,13 @@ impl ContainerState {
     }
 
     /// Records a restart attempt and arms the next backoff window.
-    fn record_restart_attempt(&mut self) {
+    fn record_restart_attempt(&mut self, name: &str) {
         self.restart_count += 1;
         let current_backoff = self.backoff;
         self.next_restart_at = Some(Instant::now() + current_backoff);
         self.backoff = (self.backoff * 2).min(MAX_BACKOFF);
         info!(
-            container = %self.name,
+            container = %name,
             attempt = self.restart_count,
             backoff_secs = current_backoff.as_secs(),
             next_backoff_secs = self.backoff.as_secs(),
@@ -172,27 +171,46 @@ async fn main() -> Result<()> {
     let mut states: HashMap<String, ContainerState> = args
         .containers
         .into_iter()
-        .map(|n| (n.clone(), ContainerState::new(n)))
+        .map(|n| (n.clone(), ContainerState::new()))
         .collect();
 
+    let mut sigterm = signal(SignalKind::terminate()).context("Failed to register SIGTERM handler")?;
+
     loop {
-        for state in states.values_mut() {
-            if let Err(e) = poll_container(&docker, state).await {
+        let docker = &docker;
+        futures::future::join_all(states.iter_mut().map(|(name, state)| async move {
+            if let Err(e) = poll_container(docker, name, state).await {
                 error!(
-                    container = %state.name,
+                    container = %name,
                     error = %e,
                     "Unexpected error while polling container"
                 );
             }
+        }))
+        .await;
+
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                info!("Received SIGINT — shutting down");
+                break;
+            }
+            _ = sigterm.recv() => {
+                info!("Received SIGTERM — shutting down");
+                break;
+            }
+            _ = tokio::time::sleep(poll_interval) => {}
         }
-        tokio::time::sleep(poll_interval).await;
     }
+
+    info!("nerd-watch stopped");
+
+    Ok(())
 }
 
 /// Inspects a container and intervenes when it is stopped or unhealthy.
-async fn poll_container(docker: &Docker, state: &mut ContainerState) -> Result<()> {
+async fn poll_container(docker: &Docker, name: &str, state: &mut ContainerState) -> Result<()> {
     match docker
-        .inspect_container(&state.name, None::<InspectContainerOptions>)
+        .inspect_container(name, None::<InspectContainerOptions>)
         .await
     {
         Ok(info) => {
@@ -208,7 +226,7 @@ async fn poll_container(docker: &Docker, state: &mut ContainerState) -> Result<(
             match status {
                 // Docker is already handling the restart via its own restart policy.
                 Some(ContainerStateStatusEnum::RESTARTING) => {
-                    info!(container = %state.name, "Container is restarting (managed by Docker) — skipping");
+                    info!(container = %name, "Container is restarting (managed by Docker) — skipping");
                     state.on_stopped();
                 }
 
@@ -220,15 +238,15 @@ async fn poll_container(docker: &Docker, state: &mut ContainerState) -> Result<(
                         let unhealthy_for = state.unhealthy_for().unwrap_or_default();
                         if unhealthy_for >= UNHEALTHY_THRESHOLD {
                             warn!(
-                                container = %state.name,
+                                container = %name,
                                 unhealthy_secs = unhealthy_for.as_secs(),
                                 threshold_secs = UNHEALTHY_THRESHOLD.as_secs(),
                                 "Container is unhealthy long enough — attempting restart"
                             );
-                            attempt_running_restart_if_due(docker, state).await?;
+                            attempt_restart_if_due(docker, name, state, RestartMode::Restart).await?;
                         } else {
                             info!(
-                                container = %state.name,
+                                container = %name,
                                 unhealthy_secs = unhealthy_for.as_secs(),
                                 threshold_secs = UNHEALTHY_THRESHOLD.as_secs(),
                                 "Container is unhealthy but still within grace period"
@@ -237,28 +255,28 @@ async fn poll_container(docker: &Docker, state: &mut ContainerState) -> Result<(
                     }
                     Some(HealthStatusEnum::STARTING) => {
                         state.on_health_starting();
-                        info!(container = %state.name, "Container health is still starting — waiting");
+                        info!(container = %name, "Container health is still starting — waiting");
                     }
                     Some(HealthStatusEnum::HEALTHY)
                     | Some(HealthStatusEnum::NONE)
                     | Some(HealthStatusEnum::EMPTY)
                     | None => {
-                        state.on_healthy();
+                        state.on_healthy(name);
                     }
                 },
 
                 // Container exists but is stopped, exited, dead, or otherwise not running.
                 Some(status_val) => {
                     state.on_stopped();
-                    warn!(container = %state.name, status = ?status_val, "Container is not running");
-                    attempt_start_if_due(docker, state).await?;
+                    warn!(container = %name, status = ?status_val, "Container is not running");
+                    attempt_restart_if_due(docker, name, state, RestartMode::Start).await?;
                 }
 
                 // No status field — treat as stopped.
                 None => {
                     state.on_stopped();
-                    warn!(container = %state.name, "Container has no status — treating as stopped");
-                    attempt_start_if_due(docker, state).await?;
+                    warn!(container = %name, "Container has no status — treating as stopped");
+                    attempt_restart_if_due(docker, name, state, RestartMode::Start).await?;
                 }
             }
         }
@@ -268,99 +286,88 @@ async fn poll_container(docker: &Docker, state: &mut ContainerState) -> Result<(
             status_code: 404, ..
         }) => {
             error!(
-                container = %state.name,
+                container = %name,
                 "Container not found — it must be created before nerd-watch can restart it"
             );
         }
 
         Err(e) => {
-            return Err(e).context(format!("Failed to inspect container '{}'", state.name));
+            return Err(e).context(format!("Failed to inspect container '{name}'"));
         }
     }
 
     Ok(())
 }
 
-/// Calls `docker start` if the backoff window has elapsed; otherwise logs the remaining wait.
-async fn attempt_start_if_due(docker: &Docker, state: &mut ContainerState) -> Result<()> {
-    if !state.should_restart_now() {
-        let wait = state
-            .next_restart_at
-            .map(|t| t.saturating_duration_since(Instant::now()))
-            .unwrap_or_default();
-        info!(
-            container = %state.name,
-            wait_secs = wait.as_secs(),
-            "Backoff in effect — waiting before next restart attempt"
-        );
-        return Ok(());
-    }
-
-    info!(
-        container = %state.name,
-        attempt = state.restart_count + 1,
-        "Attempting to start container"
-    );
-
-    match docker
-        .start_container(&state.name, None::<StartContainerOptions<String>>)
-        .await
-    {
-        Ok(()) => {
-            info!(container = %state.name, "Container started successfully");
-        }
-        // 304 Not Modified — container was already running (race with another process).
-        Err(BollardError::DockerResponseServerError {
-            status_code: 304, ..
-        }) => {
-            info!(container = %state.name, "Container was already running");
-        }
-        Err(e) => {
-            error!(container = %state.name, error = %e, "Failed to start container");
-        }
-    }
-
-    // Record the attempt regardless of outcome so the backoff applies to the next cycle.
-    state.record_restart_attempt();
-
-    Ok(())
+enum RestartMode {
+    /// Container is stopped — use `docker start`.
+    Start,
+    /// Container is running but unhealthy — use `docker restart`.
+    Restart,
 }
 
-/// Calls `docker restart` for a running but unhealthy container if the backoff window has elapsed.
-async fn attempt_running_restart_if_due(docker: &Docker, state: &mut ContainerState) -> Result<()> {
+async fn attempt_restart_if_due(
+    docker: &Docker,
+    name: &str,
+    state: &mut ContainerState,
+    mode: RestartMode,
+) -> Result<()> {
     if !state.should_restart_now() {
         let wait = state
             .next_restart_at
             .map(|t| t.saturating_duration_since(Instant::now()))
             .unwrap_or_default();
         info!(
-            container = %state.name,
+            container = %name,
             wait_secs = wait.as_secs(),
             "Backoff in effect — waiting before next restart attempt"
         );
         return Ok(());
     }
 
+    let action = match mode {
+        RestartMode::Start => "start stopped container",
+        RestartMode::Restart => "restart unhealthy container",
+    };
     info!(
-        container = %state.name,
+        container = %name,
         attempt = state.restart_count + 1,
-        "Attempting to restart unhealthy container"
+        "Attempting to {action}"
     );
 
-    match docker
-        .restart_container(&state.name, Some(RestartContainerOptions { t: 30 }))
-        .await
-    {
-        Ok(()) => {
-            info!(container = %state.name, "Container restarted successfully");
+    match mode {
+        RestartMode::Start => {
+            match docker
+                .start_container(name, None::<StartContainerOptions<String>>)
+                .await
+            {
+                Ok(()) => info!(container = %name, "Container started successfully"),
+                Err(BollardError::DockerResponseServerError {
+                    status_code: 304, ..
+                }) => {
+                    info!(container = %name, "Container was already running");
+                }
+                Err(e) => {
+                    error!(container = %name, error = %e, "Failed to start container");
+                }
+            }
         }
-        Err(e) => {
-            error!(container = %state.name, error = %e, "Failed to restart unhealthy container");
+        RestartMode::Restart => {
+            match docker
+                .restart_container(name, Some(RestartContainerOptions { t: 30 }))
+                .await
+            {
+                Ok(()) => info!(container = %name, "Container restarted successfully"),
+                Err(e) => {
+                    error!(
+                        container = %name, error = %e,
+                        "Failed to restart unhealthy container"
+                    );
+                }
+            }
         }
     }
 
-    // Record the attempt regardless of outcome so the backoff applies to the next cycle.
-    state.record_restart_attempt();
-
+    state.record_restart_attempt(name);
     Ok(())
 }
