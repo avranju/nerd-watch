@@ -1,0 +1,9 @@
+services:
+  nerd-watch:
+    image: git.nerdworks.dev/avranju/nerd-watch:latest
+    container_name: nerd-watch
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock

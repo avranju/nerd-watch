@@ -20,12 +20,22 @@ const STABILITY_THRESHOLD: Duration = Duration::from_secs(60);
     about = "Docker container watchdog — monitors containers and restarts them when they die"
 )]
 struct Args {
-    /// Names of containers to watch
-    #[arg(required = true, value_name = "CONTAINER")]
+    /// Names of containers to watch.
+    ///
+    /// Can be provided either as positional CLI arguments or via the
+    /// NERD_WATCH_CONTAINERS environment variable as a comma-separated list.
+    #[arg(
+        value_name = "CONTAINER",
+        env = "NERD_WATCH_CONTAINERS",
+        value_delimiter = ',',
+        required = true
+    )]
     containers: Vec<String>,
 
-    /// How often to poll container status, in seconds
-    #[arg(long, default_value = "5", value_name = "SECS")]
+    /// How often to poll container status, in seconds.
+    ///
+    /// Can also be set via the NERD_WATCH_POLL_INTERVAL environment variable.
+    #[arg(long, env = "NERD_WATCH_POLL_INTERVAL", default_value = "5", value_name = "SECS")]
     poll_interval: u64,
 }
 
