@@ -116,7 +116,7 @@ The repository includes a `docker-compose.yml` that uses the published image:
 ```yaml
 services:
   nerd-watch:
-    image: git.nerdworks.dev/avranju/nerd-watch:latest
+    image: ghcr.io/avranju/nerd-watch:latest
     container_name: nerd-watch
     restart: unless-stopped
     env_file:
@@ -162,20 +162,20 @@ docker compose down
 To publish the image to the configured registry:
 
 ```bash
-docker build -t git.nerdworks.dev/avranju/nerd-watch:latest .
-docker push git.nerdworks.dev/avranju/nerd-watch:latest
+docker build -t ghcr.io/avranju/nerd-watch:latest .
+docker push ghcr.io/avranju/nerd-watch:latest
 ```
 
 If you want versioned releases, tag and push an additional version tag:
 
 ```bash
 docker build \
-  -t git.nerdworks.dev/avranju/nerd-watch:latest \
-  -t git.nerdworks.dev/avranju/nerd-watch:v0.1.0 \
+  -t ghcr.io/avranju/nerd-watch:latest \
+  -t ghcr.io/avranju/nerd-watch:v0.1.0 \
   .
 
-docker push git.nerdworks.dev/avranju/nerd-watch:latest
-docker push git.nerdworks.dev/avranju/nerd-watch:v0.1.0
+docker push ghcr.io/avranju/nerd-watch:latest
+docker push ghcr.io/avranju/nerd-watch:v0.1.0
 ```
 
 ## Notes
