@@ -6,6 +6,7 @@ It is designed for cases where you want an external watcher process that:
 
 - polls container state through the Docker socket
 - restarts stopped containers
+- restarts running containers that remain unhealthy for too long
 - applies exponential backoff between restart attempts
 - resets the backoff after a container has stayed healthy for a while
 - can run as its own Docker service
@@ -17,10 +18,14 @@ For each watched container, `nerd-watch`:
 - checks the container status on a configurable poll interval
 - ignores containers already in Docker's `restarting` state
 - attempts to start containers that are stopped, exited, dead, or otherwise not running
+- restarts running containers whose Docker health status remains `unhealthy` for 60 seconds
+- does not restart containers whose Docker health status is still `starting`
 - uses exponential backoff starting at 5 seconds and capping at 5 minutes
 - resets the backoff after the container has remained stable for 60 seconds
 
 If a container does not exist, `nerd-watch` logs an error and keeps running.
+
+For health-based restarts to work, the watched container must define a Docker health check. Containers without a health check are treated as healthy as long as they are running.
 
 ## Configuration
 
@@ -31,6 +36,8 @@ If a container does not exist, `nerd-watch` logs an error and keeps running.
 - `NERD_WATCH_CONTAINERS`: comma-separated list of container names to watch
 - `NERD_WATCH_POLL_INTERVAL`: poll interval in seconds
 - `RUST_LOG`: optional Rust log filter, for example `info` or `debug`
+
+Health-based restart behavior is always enabled. A running container is restarted only after it has remained Docker-`unhealthy` for 60 seconds. Containers in Docker health state `starting` are left alone.
 
 Example:
 
