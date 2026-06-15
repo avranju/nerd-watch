@@ -1,16 +1,20 @@
 use std::collections::HashMap;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use bollard::Docker;
 use bollard::container::InspectContainerOptions;
 use bollard::container::RestartContainerOptions;
 use bollard::container::StartContainerOptions;
 use bollard::errors::Error as BollardError;
 use bollard::models::ContainerStateStatusEnum;
 use bollard::models::HealthStatusEnum;
-use bollard::Docker;
+use chrono::{DateTime, Utc};
 use clap::Parser;
-use tokio::signal::unix::{signal, SignalKind};
+use serde::Deserialize;
+use tokio::signal::unix::{SignalKind, signal};
 use tracing::{error, info, warn};
 
 const INITIAL_BACKOFF: Duration = Duration::from_secs(5);
@@ -39,15 +43,48 @@ struct Args {
     /// How often to poll container status, in seconds.
     ///
     /// Can also be set via the NERD_WATCH_POLL_INTERVAL environment variable.
-    #[arg(long, env = "NERD_WATCH_POLL_INTERVAL", default_value = "5", value_name = "SECS")]
+    #[arg(
+        long,
+        env = "NERD_WATCH_POLL_INTERVAL",
+        default_value = "5",
+        value_name = "SECS"
+    )]
     poll_interval: u64,
 
     /// Timeout in seconds given to a running container to shut down gracefully
     /// during a restart before Docker force-kills it.
     ///
     /// Can also be set via the NERD_WATCH_RESTART_TIMEOUT environment variable.
-    #[arg(long, env = "NERD_WATCH_RESTART_TIMEOUT", default_value = "30", value_name = "SECS")]
+    #[arg(
+        long,
+        env = "NERD_WATCH_RESTART_TIMEOUT",
+        default_value = "30",
+        value_name = "SECS"
+    )]
     restart_timeout: isize,
+
+    /// Directory containing per-container maintenance marker files.
+    ///
+    /// When a file named <container>.json exists in this directory with a future
+    /// expires_at timestamp, nerd-watch will continue polling but will not start
+    /// or restart that container.
+    #[arg(long, env = "NERD_WATCH_MAINTENANCE_DIR", value_name = "DIR")]
+    maintenance_dir: Option<PathBuf>,
+}
+
+/// Runtime marker written by external maintenance jobs.
+#[derive(Debug, Deserialize)]
+struct MaintenanceMarker {
+    /// RFC3339 timestamp after which the marker no longer suppresses restarts.
+    expires_at: DateTime<Utc>,
+    /// Optional human-readable reason included in logs.
+    reason: Option<String>,
+}
+
+impl MaintenanceMarker {
+    fn is_active(&self, now: DateTime<Utc>) -> bool {
+        self.expires_at > now
+    }
 }
 
 /// Per-container tracking state.
@@ -114,6 +151,12 @@ impl ContainerState {
         self.unhealthy_since = None;
     }
 
+    /// Called when an external maintenance marker suppresses intervention.
+    fn on_maintenance(&mut self) {
+        self.stable_since = None;
+        self.unhealthy_since = None;
+    }
+
     /// Returns how long the container has been continuously unhealthy, if known.
     fn unhealthy_for(&self) -> Option<Duration> {
         self.unhealthy_since.map(|since| since.elapsed())
@@ -162,6 +205,7 @@ async fn main() -> Result<()> {
         containers = ?args.containers,
         poll_interval_secs = args.poll_interval,
         restart_timeout_secs = args.restart_timeout,
+        maintenance_dir = ?args.maintenance_dir,
         "nerd-watch starting"
     );
 
@@ -183,12 +227,16 @@ async fn main() -> Result<()> {
         .map(|n| (n.clone(), ContainerState::new()))
         .collect();
 
-    let mut sigterm = signal(SignalKind::terminate()).context("Failed to register SIGTERM handler")?;
+    let mut sigterm =
+        signal(SignalKind::terminate()).context("Failed to register SIGTERM handler")?;
 
     loop {
         let docker = &docker;
+        let maintenance_dir = args.maintenance_dir.as_deref();
         futures::future::join_all(states.iter_mut().map(|(name, state)| async move {
-            if let Err(e) = poll_container(docker, name, state, restart_timeout).await {
+            if let Err(e) =
+                poll_container(docker, name, state, restart_timeout, maintenance_dir).await
+            {
                 error!(
                     container = %name,
                     error = %e,
@@ -217,7 +265,13 @@ async fn main() -> Result<()> {
 }
 
 /// Inspects a container and intervenes when it is stopped or unhealthy.
-async fn poll_container(docker: &Docker, name: &str, state: &mut ContainerState, restart_timeout: isize) -> Result<()> {
+async fn poll_container(
+    docker: &Docker,
+    name: &str,
+    state: &mut ContainerState,
+    restart_timeout: isize,
+    maintenance_dir: Option<&Path>,
+) -> Result<()> {
     match docker
         .inspect_container(name, None::<InspectContainerOptions>)
         .await
@@ -225,9 +279,7 @@ async fn poll_container(docker: &Docker, name: &str, state: &mut ContainerState,
         Ok(info) => {
             let container_state = info.state.as_ref();
             let status = container_state.and_then(|s| s.status.clone());
-            let is_running = container_state
-                .and_then(|s| s.running)
-                .unwrap_or(false);
+            let is_running = container_state.and_then(|s| s.running).unwrap_or(false);
             let health_status = container_state
                 .and_then(|s| s.health.as_ref())
                 .and_then(|h| h.status);
@@ -252,7 +304,18 @@ async fn poll_container(docker: &Docker, name: &str, state: &mut ContainerState,
                                 threshold_secs = UNHEALTHY_THRESHOLD.as_secs(),
                                 "Container is unhealthy long enough — attempting restart"
                             );
-                            attempt_restart_if_due(docker, name, state, RestartMode::Restart, restart_timeout).await?;
+                            if should_skip_for_maintenance(name, maintenance_dir)? {
+                                state.on_maintenance();
+                            } else {
+                                attempt_restart_if_due(
+                                    docker,
+                                    name,
+                                    state,
+                                    RestartMode::Restart,
+                                    restart_timeout,
+                                )
+                                .await?;
+                            }
                         } else {
                             info!(
                                 container = %name,
@@ -278,14 +341,32 @@ async fn poll_container(docker: &Docker, name: &str, state: &mut ContainerState,
                 Some(status_val) => {
                     state.on_stopped();
                     warn!(container = %name, status = ?status_val, "Container is not running");
-                    attempt_restart_if_due(docker, name, state, RestartMode::Start, restart_timeout).await?;
+                    if !should_skip_for_maintenance(name, maintenance_dir)? {
+                        attempt_restart_if_due(
+                            docker,
+                            name,
+                            state,
+                            RestartMode::Start,
+                            restart_timeout,
+                        )
+                        .await?;
+                    }
                 }
 
                 // No status field — treat as stopped.
                 None => {
                     state.on_stopped();
                     warn!(container = %name, "Container has no status — treating as stopped");
-                    attempt_restart_if_due(docker, name, state, RestartMode::Start, restart_timeout).await?;
+                    if !should_skip_for_maintenance(name, maintenance_dir)? {
+                        attempt_restart_if_due(
+                            docker,
+                            name,
+                            state,
+                            RestartMode::Start,
+                            restart_timeout,
+                        )
+                        .await?;
+                    }
                 }
             }
         }
@@ -306,6 +387,59 @@ async fn poll_container(docker: &Docker, name: &str, state: &mut ContainerState,
     }
 
     Ok(())
+}
+
+fn should_skip_for_maintenance(name: &str, maintenance_dir: Option<&Path>) -> Result<bool> {
+    let Some(dir) = maintenance_dir else {
+        return Ok(false);
+    };
+
+    let marker_path = dir.join(format!("{name}.json"));
+    let marker_json = match fs::read_to_string(&marker_path) {
+        Ok(content) => content,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => {
+            warn!(
+                container = %name,
+                marker = %marker_path.display(),
+                error = %e,
+                "Failed to read maintenance marker — ignoring marker"
+            );
+            return Ok(false);
+        }
+    };
+
+    let marker: MaintenanceMarker = match serde_json::from_str(&marker_json) {
+        Ok(marker) => marker,
+        Err(e) => {
+            warn!(
+                container = %name,
+                marker = %marker_path.display(),
+                error = %e,
+                "Failed to parse maintenance marker — ignoring marker"
+            );
+            return Ok(false);
+        }
+    };
+
+    if marker.is_active(Utc::now()) {
+        info!(
+            container = %name,
+            marker = %marker_path.display(),
+            expires_at = %marker.expires_at.to_rfc3339(),
+            reason = marker.reason.as_deref().unwrap_or("unspecified"),
+            "Container is in maintenance mode — skipping restart"
+        );
+        return Ok(true);
+    }
+
+    info!(
+        container = %name,
+        marker = %marker_path.display(),
+        expires_at = %marker.expires_at.to_rfc3339(),
+        "Maintenance marker has expired — resuming normal restart behavior"
+    );
+    Ok(false)
 }
 
 enum RestartMode {
@@ -385,6 +519,7 @@ async fn attempt_restart_if_due(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Duration as ChronoDuration;
     use std::time::{Duration, Instant};
 
     #[test]
@@ -576,5 +711,53 @@ mod tests {
         // Place the backoff window in the past.
         state.next_restart_at = Some(Instant::now() - Duration::from_secs(1));
         assert!(state.should_restart_now());
+    }
+
+    #[test]
+    fn active_maintenance_marker_suppresses_restart() {
+        let dir = unique_test_dir("active_maintenance_marker_suppresses_restart");
+        fs::create_dir_all(&dir).unwrap();
+
+        let expires_at = (Utc::now() + ChronoDuration::minutes(30)).to_rfc3339();
+        fs::write(
+            dir.join("test.json"),
+            format!(r#"{{"expires_at":"{expires_at}","reason":"backup"}}"#),
+        )
+        .unwrap();
+
+        assert!(should_skip_for_maintenance("test", Some(&dir)).unwrap());
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn expired_maintenance_marker_does_not_suppress_restart() {
+        let dir = unique_test_dir("expired_maintenance_marker_does_not_suppress_restart");
+        fs::create_dir_all(&dir).unwrap();
+
+        let expires_at = (Utc::now() - ChronoDuration::minutes(30)).to_rfc3339();
+        fs::write(
+            dir.join("test.json"),
+            format!(r#"{{"expires_at":"{expires_at}","reason":"backup"}}"#),
+        )
+        .unwrap();
+
+        assert!(!should_skip_for_maintenance("test", Some(&dir)).unwrap());
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn missing_maintenance_marker_does_not_suppress_restart() {
+        let dir = unique_test_dir("missing_maintenance_marker_does_not_suppress_restart");
+        fs::create_dir_all(&dir).unwrap();
+
+        assert!(!should_skip_for_maintenance("test", Some(&dir)).unwrap());
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn unique_test_dir(test_name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("nerd-watch-{test_name}-{}", std::process::id()))
     }
 }
