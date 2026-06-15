@@ -278,7 +278,7 @@ async fn poll_container(
     {
         Ok(info) => {
             let container_state = info.state.as_ref();
-            let status = container_state.and_then(|s| s.status.clone());
+            let status = container_state.and_then(|s| s.status);
             let is_running = container_state.and_then(|s| s.running).unwrap_or(false);
             let health_status = container_state
                 .and_then(|s| s.health.as_ref())
